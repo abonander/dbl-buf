@@ -1,0 +1,9 @@
+[package]
+name = "dbl-buf"
+version = "0.1.0"
+authors = ["Austin Bonander <austin.bonander@gmail.com>"]
+
+[dependencies]
+winapi = "*"
+kernel32-sys = "*"
+libc = "*"
