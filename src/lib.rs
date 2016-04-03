@@ -1,22 +1,20 @@
-
-use std::cell::UnsafeCell;
-use std::iter::RangeTo;
-use std::rc::Rc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::ops::{Not, Range, Deref, DerefMut};
+use std::sync::atomic::{AtomicIsize, Ordering};
 use std::sync::{Arc, RwLock, RwLockReadGuard as ReadGuard, TryLockError};
-use std::{ops, ptr};
+use std::time::Duration;
+use std::{cmp, ptr, thread};
 
 use align::AlignedBufs;
 
 mod align;
 
-#[derive(Copy, Debug, PartialEq, Eq)]
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
 enum WriteBuf {
     A,
     B,
 }
 
-impl ops::Not for WriteBuf {
+impl Not for WriteBuf {
     type Output = Self;
 
     fn not(self) -> Self { 
@@ -30,11 +28,12 @@ impl ops::Not for WriteBuf {
 pub struct DblBuf<T> {
     bufs: AlignedBufs<T>,
     lock: RwLock<WriteBuf>,
-    swap_waiting: AtomicBool,
+    waiting: AtomicIsize,
+    threads: usize,
 }
 
 impl<T> DblBuf<T> {
-    pub fn new(threads: usize, mut bufa: Vec<T>, mut bufb: Vec<T>) -> Handles<T> {
+    pub fn new(threads: usize, mut bufa: Vec<T>, mut bufb: Vec<T>) -> (Arc<Self>, Handles<T>) {
         assert_eq!(bufa.len(), bufb.len());
 
         let bufs = AlignedBufs::alloc(bufa.len());
@@ -44,10 +43,35 @@ impl<T> DblBuf<T> {
             bufa.set_len(0);
             ptr::copy_nonoverlapping(bufb.as_ptr(), bufs.bufb().as_mut_ptr(), bufb.len());
             bufb.set_len(0);
-        }       
+        }   
+
+        let len = bufs.len();
+        let aligned_len = align::cache_aligned_len::<T>();
+            
+        let dblbuf = Arc::new(
+            DblBuf {
+                bufs: bufs,
+                lock: RwLock::new(WriteBuf::A),
+                waiting: AtomicIsize::new(0),
+                threads: threads,
+            }
+        );
+
+        (
+            dblbuf.clone(),
+            Handles {
+                buf: dblbuf,
+                ranges: ChunkRanges {
+                    aligned_len: aligned_len,
+                    rem_count: threads,
+                    curr: 0,
+                    end: len,
+                }
+            }
+        )                
     }
 
-    pub fn try_read(&self) -> Option<ReadHandle> {
+    pub fn try_read(&self) -> Option<ReadHandle<T>> {
         let guard = match self.lock.try_read() {
             Ok(guard) => guard,
             Err(TryLockError::WouldBlock) => return None,
@@ -56,84 +80,88 @@ impl<T> DblBuf<T> {
 
         let buf = unsafe { self.get_buf(!*guard) };
         
-        ReadHandle {
+        Some(ReadHandle {
+            parent: self,
             guard: guard,
             buf: buf,
-        }
+        })
     }
 
-    pub fn read(&self) -> ReadHandle {
+    pub fn read(&self) -> ReadHandle<T> {
         let guard = self.lock.read().unwrap();
         let buf = unsafe { self.get_buf(!*guard) };
 
         ReadHandle {
+            parent: self,
             guard: guard,
             buf: buf,
         }
     }
 
-    unsafe fn write(&self, range: Range<usize>) -> WriteHandle {
+    unsafe fn write(&self, range: Range<usize>) -> WriteHandle<T> {
         let guard = self.lock.read().unwrap();
 
         let buf = self.get_buf(*guard);
 
         WriteHandle {
+            parent: self,
             guard: guard,
             buf: &mut buf[range],
         }
     }
 
     unsafe fn get_buf(&self, write_buf: WriteBuf) -> &mut [T] {
-        match *write_buf {
+        match write_buf {
             WriteBuf::A => self.bufs.bufa(),
             WriteBuf::B => self.bufs.bufb(),
         }
     }
 
-    pub fn swap_waiting(&self) -> bool {
-        self.swap_waiting.load(Ordering::Acquire)
+    pub fn waiting(&self) -> bool {
+        self.waiting.load(Ordering::Acquire) != 0
     }
 
-    fn swap(&self) {
-        let swap_waiting = self.swap_waiting.swap(true, Ordering::AcqRel);
+    fn swap(&self) -> bool {        
+        let mut waiting = self.waiting.load(Ordering::Acquire);
 
-        if !swap_waiting { 
-            let write = self.lock.write().unwrap();
-
-            *write = !*write;
-
-            swap_waiting.store(false, Ordering::Release);
-            return;
+        while { 
+            waiting = self.waiting.load(Ordering::Acquire);
+            waiting > 0
+        } {
+            thread::sleep(Duration::new(0, 0));            
         }
 
-        let mut last = ;
-
-        while {last = ; 
-
-
-
+        true        
     }
 }
 
 impl<T: Clone> DblBuf<T> {
-    pub fn new_with_elem<T: Clone>(threads: usize, buf_size: usize, elem: T) -> Handles<T> {
+    pub fn new_with_elem(threads: usize, buf_size: usize, elem: T) -> (Arc<Self>, Handles<T>) {
         let bufa = vec![elem.clone(); buf_size];
         let bufb = vec![elem; buf_size];
-        new(threads, bufa, bufb);
+        Self::new(threads, bufa, bufb)
     }
 }
 
-#[derive(Debug)]
+impl<T> Drop for DblBuf<T> {
+    fn drop(&mut self) {
+        // Safe because there should be no references to this struct anymore.
+        unsafe {
+            self.bufs.drop_all();
+        }
+    }
+}
+
 pub struct BufHandle<T> { 
     buf: Arc<DblBuf<T>>,
     mut_range: Range<usize>,
 }
 
 impl<T> BufHandle<T> {
-    pub fn read_write(&mut self) -> (ReadHandle, WriteHandle) {
+    pub fn read_write(&mut self) -> (ReadHandle<T>, WriteHandle<T>) {
         (
             self.buf.read(),
-            unsafe { self.buf.write() },
+            unsafe { self.buf.write(self.mut_range.clone()) },
         )
     }
 
@@ -142,32 +170,73 @@ impl<T> BufHandle<T> {
     }
 }
 
-impl !Sync for BufHandle {}
+fn next_multiple(from: usize, base: usize) -> usize {
+    (from / base + if from % base != 0 { 1 } else { 0 })
+        * base
+}
 
-pub struct Handles<T> {
-    buf: Arc<DblBuf<T>>,
-    
+struct ChunkRanges {
+    aligned_len: usize,
+    rem_count: usize,
+    curr: usize,
+    end: usize,
+}
 
-impl Iterator for Handles<T> {
-    type Item = BufHandle<T>;
+impl Iterator for ChunkRanges {
+    type Item = Range<usize>;
 
     fn next(&mut self) -> Option<Self::Item> {
-        self.0.next().map(ThreadToken)
+        if self.rem_count > 0 {
+            let start = self.curr;
+            let rem_len = self.end - self.curr;
+        
+            let raw_chunk_size = rem_len / self.rem_count;
+
+            // Get the next multiple of `self.aligned_len` up from `raw_chunk_size`
+            let chunk_size = next_multiple(raw_chunk_size, self.aligned_len);
+
+            let end = cmp::min(start + chunk_size, self.end);
+            self.curr = end;
+            self.rem_count -= 1;
+
+            Some(start .. end)
+        } else {
+            None
+        } 
     }
 }
 
-pub struct WriteHandle<'a, T> {
-    guard: ReadGuard<'a, T>,
+pub struct Handles<T> {
+    buf: Arc<DblBuf<T>>,
+    ranges: ChunkRanges,    
+}    
+
+impl<T> Iterator for Handles<T> {
+    type Item = BufHandle<T>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        self.ranges.next().map(|range| 
+            BufHandle {
+                buf: self.buf.clone(),
+                mut_range: range,
+            }
+        )
+    }
+}
+
+pub struct WriteHandle<'a, T: 'a> {
+    parent: &'a DblBuf<T>,
+    guard: ReadGuard<'a, WriteBuf>,
     buf: &'a mut [T],
 }
 
-impl DerefMut for WriteHandle<'a, T> {
+impl<'a, T: 'a> DerefMut for WriteHandle<'a, T> {
     fn deref_mut(&mut self) -> &mut [T] {
         self.buf
     }
 }
 
-impl Deref for WriteHandle<'a, T> {
+impl<'a, T: 'a> Deref for WriteHandle<'a, T> {
     type Target = [T];
     
     fn deref(&self) -> &[T] {
@@ -175,16 +244,30 @@ impl Deref for WriteHandle<'a, T> {
     }
 }
 
-pub struct ReadHandle<'a, T> {
-    guard: ReadGuard<'a, T>,
+/// Get the indices in the original buffer for the given `WriteHandle`.
+pub fn write_range<T>(hndl: &WriteHandle<T>) -> (usize, usize) {
+    let ptr = hndl.buf.as_ptr();
+    let orig_ptr = unsafe { hndl.parent.get_buf(*hndl.guard).as_ptr() };
+    let offset = orig_ptr as usize - ptr as usize;
+
+    (offset, offset + hndl.buf.len())
+}
+
+pub struct ReadHandle<'a, T: 'a> {
+    parent: &'a DblBuf<T>,
+    guard: ReadGuard<'a, WriteBuf>,
     buf: &'a [T],
 }
 
-impl Deref for ReadHandle<[T]> {
+impl<'a, T: 'a> Deref for ReadHandle<'a, T> {
     type Target = [T];
     fn deref(&self) -> &[T] {
         self.buf
     }
+}
+
+fn gcf_3(x: usize, y: usize, z: usize) -> usize {
+    gcf(x, gcf(y, z))
 }
 
 fn lcm(x: usize, y: usize) -> usize {
@@ -192,7 +275,7 @@ fn lcm(x: usize, y: usize) -> usize {
 }
 
 fn gcf(x: usize, y: usize) -> usize {
-    let mut (num, denom) = if (x > y) { (x, y) } else { (y, x) };
+    let (mut num, mut denom) = if x > y { (x, y) } else { (y, x) };
 
     let mut rem;
 
@@ -203,3 +286,4 @@ fn gcf(x: usize, y: usize) -> usize {
 
     denom
 }
+
