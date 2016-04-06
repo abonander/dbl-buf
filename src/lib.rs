@@ -1,12 +1,20 @@
+#![feature(alloc, heap_api)]
+
+extern crate alloc;
+
+use std::cell::UnsafeCell;
 use std::ops::{Not, Range, Deref, DerefMut};
-use std::sync::atomic::{AtomicIsize, Ordering};
-use std::sync::{Arc, RwLock, RwLockReadGuard as ReadGuard, TryLockError};
-use std::time::Duration;
-use std::{cmp, ptr, thread};
+use std::sync::{
+    Arc, RwLock, TryLockError,
+    RwLockReadGuard as ReadGuard,
+    RwLockWriteGuard as WriteGuard, 
+};
+use std::{cmp, ptr};
 
 use align::AlignedBufs;
 
 mod align;
+mod math;
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 enum WriteBuf {
@@ -26,10 +34,8 @@ impl Not for WriteBuf {
 }
 
 pub struct DblBuf<T> {
-    bufs: AlignedBufs<T>,
-    lock: RwLock<WriteBuf>,
-    waiting: AtomicIsize,
-    threads: usize,
+    bufs: UnsafeCell<AlignedBufs<T>>,
+    lock: RwLock<WriteBuf>, 
 }
 
 impl<T> DblBuf<T> {
@@ -50,10 +56,8 @@ impl<T> DblBuf<T> {
             
         let dblbuf = Arc::new(
             DblBuf {
-                bufs: bufs,
+                bufs: UnsafeCell::new(bufs),
                 lock: RwLock::new(WriteBuf::A),
-                waiting: AtomicIsize::new(0),
-                threads: threads,
             }
         );
 
@@ -81,8 +85,8 @@ impl<T> DblBuf<T> {
         let buf = unsafe { self.get_buf(!*guard) };
         
         Some(ReadHandle {
-            parent: self,
-            guard: guard,
+            _parent: self,
+            _guard: guard,
             buf: buf,
         })
     }
@@ -92,8 +96,8 @@ impl<T> DblBuf<T> {
         let buf = unsafe { self.get_buf(!*guard) };
 
         ReadHandle {
-            parent: self,
-            guard: guard,
+            _parent: self,
+            _guard: guard,
             buf: buf,
         }
     }
@@ -110,28 +114,56 @@ impl<T> DblBuf<T> {
         }
     }
 
+    unsafe fn get_bufs(&self, write_buf: WriteBuf) -> (&mut [T], &mut [T]) {
+        (
+            self.get_buf(write_buf),
+            self.get_buf(!write_buf),
+        )
+    }
+
     unsafe fn get_buf(&self, write_buf: WriteBuf) -> &mut [T] {
+        let bufs = self.bufs();
+
         match write_buf {
-            WriteBuf::A => self.bufs.bufa(),
-            WriteBuf::B => self.bufs.bufb(),
+            WriteBuf::A => bufs.bufa(),
+            WriteBuf::B => bufs.bufb(),
         }
+    } 
+
+
+    unsafe fn bufs_mut(&self) -> &mut AlignedBufs<T> {
+        &mut *self.bufs.get()
     }
 
-    pub fn waiting(&self) -> bool {
-        self.waiting.load(Ordering::Acquire) != 0
+    unsafe fn bufs(&self) -> &AlignedBufs<T> {
+        &*self.bufs.get()
     }
 
-    fn swap(&self) -> bool {        
-        let mut waiting = self.waiting.load(Ordering::Acquire);
+    pub fn swap(&self) {
+        let curr = match self.lock.try_read() {
+            Ok(guard) => *guard,
+            // Already trying to swap, just wait for release
+            Err(TryLockError::WouldBlock) => {
+                let _ = self.lock.read().unwrap();
+                return;
+            },
+            // Lock poisoned, panic
+            e => { let _ = e.unwrap(); unreachable!() },
+        };
 
-        while { 
-            waiting = self.waiting.load(Ordering::Acquire);
-            waiting > 0
-        } {
-            thread::sleep(Duration::new(0, 0));            
+        *self.lock.write().unwrap() = !curr;
+
+        println!("Swap! {:?} -> {:?}", curr, !curr);
+    }
+
+    /// Block until exclusive access to both buffers is available (preempt a swap).
+    pub fn exclusive(&self) -> Exclusive<T> {
+        let guard = self.lock.write().unwrap();
+
+        Exclusive {
+            parent: self,
+            guard: guard,
         }
-
-        true        
     }
 }
 
@@ -147,7 +179,9 @@ impl<T> Drop for DblBuf<T> {
     fn drop(&mut self) {
         // Safe because there should be no references to this struct anymore.
         unsafe {
-            self.bufs.drop_all();
+            let mut bufs = self.bufs_mut();
+            bufs.drop_all();
+            bufs.free();
         }
     }
 }
@@ -170,11 +204,6 @@ impl<T> BufHandle<T> {
     }
 }
 
-fn next_multiple(from: usize, base: usize) -> usize {
-    (from / base + if from % base != 0 { 1 } else { 0 })
-        * base
-}
-
 struct ChunkRanges {
     aligned_len: usize,
     rem_count: usize,
@@ -193,7 +222,7 @@ impl Iterator for ChunkRanges {
             let raw_chunk_size = rem_len / self.rem_count;
 
             // Get the next multiple of `self.aligned_len` up from `raw_chunk_size`
-            let chunk_size = next_multiple(raw_chunk_size, self.aligned_len);
+            let chunk_size = math::next_multiple(raw_chunk_size, self.aligned_len);
 
             let end = cmp::min(start + chunk_size, self.end);
             self.curr = end;
@@ -206,6 +235,7 @@ impl Iterator for ChunkRanges {
     }
 }
 
+/// An iterator which yields `BufHandle`.
 pub struct Handles<T> {
     buf: Arc<DblBuf<T>>,
     ranges: ChunkRanges,    
@@ -254,8 +284,8 @@ pub fn write_range<T>(hndl: &WriteHandle<T>) -> (usize, usize) {
 }
 
 pub struct ReadHandle<'a, T: 'a> {
-    parent: &'a DblBuf<T>,
-    guard: ReadGuard<'a, WriteBuf>,
+    _parent: &'a DblBuf<T>,
+    _guard: ReadGuard<'a, WriteBuf>,
     buf: &'a [T],
 }
 
@@ -266,24 +296,60 @@ impl<'a, T: 'a> Deref for ReadHandle<'a, T> {
     }
 }
 
-fn gcf_3(x: usize, y: usize, z: usize) -> usize {
-    gcf(x, gcf(y, z))
+pub struct Exclusive<'a, T: 'a> {
+    parent: &'a DblBuf<T>,
+    guard: WriteGuard<'a, WriteBuf>,
 }
 
-fn lcm(x: usize, y: usize) -> usize {
-    x * y / gcf(x, y)
-}
-
-fn gcf(x: usize, y: usize) -> usize {
-    let (mut num, mut denom) = if x > y { (x, y) } else { (y, x) };
-
-    let mut rem;
-
-    while {rem = num % denom; rem != 0} {
-        num = denom;
-        denom = rem;
+impl<'a, T: 'a> Exclusive<'a, T> {
+    pub fn bufs(&mut self) -> (&mut [T], &mut [T]) {
+        // Safe because we have exclusive access to the buffers
+        unsafe { self.parent.get_bufs(*self.guard) }
     }
 
-    denom
-}
+    pub fn resize_with_fn<F: FnMut(usize) -> T>(&mut self, new_len: usize, mut resize_fn: F) {
+        let bufs = unsafe { self.parent.bufs_mut() };
 
+        let old_len = bufs.len();
+
+        unsafe {
+            if new_len < bufs.len() {
+                bufs.drop_range(old_len, new_len);
+            }
+            bufs.realloc(new_len);
+        }
+        
+        if new_len > old_len {
+            let mut make_buf = || (old_len .. new_len).map(&mut resize_fn).collect::<Vec<T>>();
+            let mut bufa_extend = make_buf();
+            let mut bufb_extend = make_buf();
+
+            unsafe {
+                let mut bufa = &mut bufs.bufa()[new_len ..];
+
+                ptr::copy_nonoverlapping(
+                    bufa_extend.as_ptr(),
+                    bufa.as_mut_ptr(),
+                    bufa.len(),
+                );
+
+                bufa_extend.set_len(0);
+
+                let mut bufb = &mut bufs.bufb()[new_len ..];
+
+                ptr::copy_nonoverlapping(
+                    bufb_extend.as_ptr(),
+                    bufb.as_mut_ptr(),
+                    bufb.len(),
+                );
+
+                bufb_extend.set_len(0);
+            }
+        }
+    }
+
+    pub fn swap(&mut self) {
+        let curr = *self.guard;
+        *self.guard = !curr;
+    }
+}
