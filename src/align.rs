@@ -1,74 +1,37 @@
+use alloc::heap;
+
 use math;
 
-use std::marker::PhantomData;
 use std::{mem, ptr, slice};
 
 const CACHE_LINE: usize = 64;
 
-pub struct Bufs<T> {
-    alloc: Box<[u8]>,
-    bufa_offset: usize,
-    bufb_offset: usize,
+pub struct AlignedBufs<T> {
+    bufa: *mut T,
+    bufb: *mut T,
     len: usize,
-    _marker: PhantomData<T>,
 }
 
-impl<T> Bufs<T> {
-    pub fn alloc(cap: usize) -> Self {
-        let (alloc_size, bufb_offset) = alloc_info::<T>(cap);
-        
-        let alloc = {
-            let mut vec = Vec::with_capacity(alloc_size);
-            unsafe {
-                vec.set_len(alloc_size);
-            }
+impl<T> AlignedBufs<T> {
+    pub fn alloc(len: usize) -> Self {
+        let (bufb_offset, alloc_size) = alloc_info::<T>(len);
 
-            vec.into_boxed_slice()
+        let (bufa_ptr, bufb_ptr) = unsafe { 
+            let ptr = heap::allocate(alloc_size, CACHE_LINE);
+
+            assert!(!ptr.is_null(), "Failure to allocate");
+
+            (ptr, ptr.offset(bufb_offset as isize))
         };
-
-        let bufa_offset = aligned_offset(alloc.as_ptr());
-        let bufb_offset = bufa_offset + bufb_offset;
-
-        Bufs {
-            alloc: alloc,
-            bufa_offset: bufa_offset,
-            bufb_offset: bufb_offset,
-            len: 0,
-        }    
-    }
-
-    pub fn with(mut bufa: Vec<T>, mut bufb: Vec<T>) -> Self {
-        let len = cmp::min(bufa.len(), bufb.len());
-        bufa.truncate(len);
-        bufb.truncate(len);
-
-        let mut self_ = Self::alloc(len);
-
-        unsafe {
-            self_.set_len(len);
+        
+        AlignedBufs {
+            bufa: bufa_ptr as *mut T,
+            bufb: bufb_ptr as *mut T,
+            len: len,
         }
+    } 
 
-        let (bufa_, bufb_) = self_.bufs();
-
-        unsafe {
-            ptr::copy_nonoverlapping(
-                bufa.as_ptr(),
-                bufa_.as_mut_ptr(),
-                len
-            );
-
-            ptr::copy_nonoverlapping(
-                bufb.as_ptr(),
-                bufb_.as_mut_ptr(),
-                len
-            );
-        }
-
-        self_
-    }
-
-
-    pub fn realloc(&mut self, new_cap: usize) {
+    pub fn realloc(&mut self, new_len: usize) {
         let old_offset = self.bufb_offset();
         let old_size = self.alloc_size();
 
@@ -100,43 +63,58 @@ impl<T> Bufs<T> {
                 self.bufb = ptr.offset(new_offset as isize) as *mut T;
             }
         }
- 
+        
         self.len = new_len;
     }
 
-    pub fn bufs(&mut self) -> (&mut [T], &mut [T]) {
-        unsafe {
-            (
-                slice::from_parts_mut(
-                    (&mut self.alloc[self.bufa_offset]) as *mut u8 as *mut T,
-                    self.len
-                ),
-                slice::from_parts_mut(
-                    (&mut self.alloc[self.bufb_offset]) as *mut u8 as *mut T,
-                    self.len
-                )
-            )
-        }
+    pub unsafe fn bufa(&self) -> &mut [T] {
+        slice::from_raw_parts_mut(self.bufa, self.len)
     }
 
-    pub unsafe fn set_len(&mut self, len: usize) {
-        self.len = len;
+    pub unsafe fn bufb(&self) -> &mut [T] {
+        slice::from_raw_parts_mut(self.bufb, self.len)        
     }
 
     pub fn len(&self) -> usize {
         self.len
-    } 
+    }
+
+    pub unsafe fn drop_range(&mut self, from: usize, to: usize) {
+        for val in &mut self.bufa()[from .. to] {
+            ptr::drop_in_place(val);
+        } 
+        
+        for val in &mut self.bufb()[from .. to] {
+            ptr::drop_in_place(val);
+        }
+    }
+
+    pub unsafe fn drop_all(&mut self) {
+        for val in self.bufa() {
+            ptr::drop_in_place(val);
+        }
+
+        for val in self.bufb() {
+            ptr::drop_in_place(val);
+        }
+    }
+
+    pub unsafe fn free(&mut self) {
+        let alloc_size = self.alloc_size();
+
+        heap::deallocate(self.bufa as *mut u8, alloc_size, CACHE_LINE);
+    }
 
     unsafe fn move_bufb(&mut self, new_offset: usize) {
-        let bufb_ptr = self.bufs().1.as_mut_ptr();
-        
-        let curr_offset = self.bufb_offset;
+        let curr_offset = self.bufb_offset();
         let rel_offset = new_offset as isize - (curr_offset as isize);
-        
-        let bufb_newptr = (bufb_ptr as *mut u8).offset(rel_offset) as *mut T;
-        ptr::copy(bufb_ptr, bufb_newptr, self.len);
 
-        self.bufb_offset = new_offset;
+        // Offset by byte count
+        let bufb_newptr = (self.bufb as *mut u8).offset(rel_offset) as *mut T;
+
+        ptr::copy(self.bufb, bufb_newptr, self.len);
+
+        self.bufb = bufb_newptr;
     }
 
     fn bufb_offset(&self) -> usize {
@@ -148,16 +126,13 @@ impl<T> Bufs<T> {
     }
 }
 
+unsafe impl<T: Send> Send for AlignedBufs<T> {}
+unsafe impl<T: Sync> Sync for AlignedBufs<T> {}
+
 fn size_of_alloc<T>(len: usize) -> usize {
     mem::size_of::<T>().checked_mul(len)
         .expect("Overflow calculating alloc size")
 }
-
-fn aligned_offset<T>(ptr: *const T) -> usize {
-    let ptr_val = ptr as usize;
-    let aligned_ptr = next_cache_line(ptr_val);
-    aligned_ptr - ptr_val
-}    
 
 // Get the next multiple of `CACHE_LINE` up from `from`
 fn next_cache_line(from: usize) -> usize {
@@ -174,8 +149,7 @@ pub fn cache_aligned_len<T>() -> usize {
 fn alloc_info<T>(len: usize) -> (usize, usize) {
     let buf_size = size_of_alloc::<T>(len);
     let bufb_offset = next_cache_line(buf_size);
-    // Overallocate to align to a cache line
-    let alloc_size = bufb_offset + buf_size + CACHE_LINE;
+    let alloc_size = bufb_offset + buf_size;
 
     (bufb_offset, alloc_size)
 }

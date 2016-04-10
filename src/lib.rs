@@ -1,3 +1,7 @@
+#![feature(alloc, heap_api)]
+
+extern crate alloc;
+
 use std::cell::UnsafeCell;
 use std::ops::{Not, Range, Deref, DerefMut};
 use std::sync::{
@@ -7,7 +11,7 @@ use std::sync::{
 };
 use std::{cmp, ptr};
 
-use align::Bufs;
+use align::AlignedBufs;
 
 mod align;
 mod math;
