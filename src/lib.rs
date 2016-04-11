@@ -3,6 +3,7 @@
 extern crate alloc;
 
 use std::cell::UnsafeCell;
+use std::marker::PhantomData;
 use std::ops::{Not, Range, Deref, DerefMut};
 use std::sync::{
     Arc, RwLock, TryLockError,
@@ -33,46 +34,131 @@ impl Not for WriteBuf {
     }
 }
 
+struct BufState<T> {
+    ranges: Vec<(usize, usize)>,
+    write_buf: WriteBuf,
+    _marker: PhantomData<*const T>,
+}
+
+impl<T> BufState<T> {
+    fn new(threads: usize, len: usize) -> Self {
+        let ranges = ChunkRanges::new::<T>(threads, len);
+
+        BufState {
+            ranges: ranges.collect(),
+            write_buf: WriteBuf::A,
+            _marker: PhantomData,
+        }
+    }
+
+    fn range(&self, thread: usize) -> Range<usize> {
+        let (start, end) = self.ranges[thread];
+        start .. end
+    }
+
+    fn redistribute(&mut self, new_len: usize) {
+        let threads = self.ranges.len();
+        let ranges = ChunkRanges::new::<T>(threads, new_len);
+
+        self.ranges.truncate(0);
+        self.ranges.extend(ranges);
+    }
+}
+
+struct ChunkRanges {
+    aligned_len: usize,
+    rem_count: usize,
+    curr: usize,
+    end: usize,
+}
+
+impl ChunkRanges {
+    fn new<T>(threads: usize, len: usize) -> Self {
+        let aligned_len = align::cache_aligned_len::<T>();
+
+        ChunkRanges {
+            aligned_len: aligned_len,
+            rem_count: threads,
+            curr: 0,
+            end: len,
+        }
+    }
+}
+
+impl Iterator for ChunkRanges {
+    type Item = (usize, usize);
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.rem_count > 0 {
+            let start = self.curr;
+            let rem_len = self.end - self.curr;
+        
+            let raw_chunk_size = rem_len / self.rem_count;
+
+            // Get the next multiple of `self.aligned_len` up from `raw_chunk_size`
+            let chunk_size = math::next_multiple(raw_chunk_size, self.aligned_len);
+
+            let end = cmp::min(start + chunk_size, self.end);
+            self.curr = end;
+            self.rem_count -= 1;
+
+            Some((start, end))
+        } else {
+            None
+        } 
+    }
+}
+
+pub type NewDblBuf<T> = (Arc<DblBuf<T>>, Handles<T>);
+
 pub struct DblBuf<T> {
     bufs: UnsafeCell<AlignedBufs<T>>,
-    lock: RwLock<WriteBuf>, 
+    lock: RwLock<BufState<T>>, 
 }
 
 impl<T> DblBuf<T> {
-    pub fn new(threads: usize, mut bufa: Vec<T>, mut bufb: Vec<T>) -> (Arc<Self>, Handles<T>) {
+    pub fn with_cap(threads: usize, cap: usize) -> NewDblBuf<T> {
+        let bufs = AlignedBufs::alloc(cap);
+        let state = BufState::new(threads, 0);
+
+        Self::new(bufs, state, threads)                        
+    } 
+
+    pub fn with_bufs(threads: usize, mut bufa: Vec<T>, mut bufb: Vec<T>) -> NewDblBuf<T> {
         assert_eq!(bufa.len(), bufb.len());
 
-        let bufs = AlignedBufs::alloc(bufa.len());
+        let len = bufa.len();
+        let mut bufs = AlignedBufs::alloc(len);
 
         unsafe { 
-            ptr::copy_nonoverlapping(bufa.as_ptr(), bufs.bufa().as_mut_ptr(), bufa.len());
+            ptr::copy_nonoverlapping(bufa.as_ptr(), bufs.bufa_ptr(), len);
             bufa.set_len(0);
-            ptr::copy_nonoverlapping(bufb.as_ptr(), bufs.bufb().as_mut_ptr(), bufb.len());
+            ptr::copy_nonoverlapping(bufb.as_ptr(), bufs.bufb_ptr(), len);
             bufb.set_len(0);
+
+            bufs.set_len(len);
         }   
 
-        let len = bufs.len();
-        let aligned_len = align::cache_aligned_len::<T>();
-            
-        let dblbuf = Arc::new(
-            DblBuf {
-                bufs: UnsafeCell::new(bufs),
-                lock: RwLock::new(WriteBuf::A),
-            }
-        );
+        let state = BufState::new(threads, len);
+           
+        Self::new(bufs, state, threads)                        
+    }
 
+    fn new(bufs: AlignedBufs<T>, state: BufState<T>, threads: usize) -> NewDblBuf<T> {
+        assert_eq!(state.ranges.len(), threads);
+
+        let dblbuf = Arc::new(DblBuf {
+            bufs: UnsafeCell::new(bufs),
+            lock: RwLock::new(state),
+        });
+            
         (
             dblbuf.clone(),
             Handles {
                 buf: dblbuf,
-                ranges: ChunkRanges {
-                    aligned_len: aligned_len,
-                    rem_count: threads,
-                    curr: 0,
-                    end: len,
-                }
+                threads: 0 .. threads 
             }
-        )                
+        )
     }
 
     pub fn try_read(&self) -> Option<ReadHandle<T>> {
@@ -82,7 +168,7 @@ impl<T> DblBuf<T> {
             Err(TryLockError::Poisoned(err)) => Err(err).unwrap(),
         };
 
-        let buf = unsafe { self.get_buf(!*guard) };
+        let buf = unsafe { self.get_buf(!guard.write_buf) };
         
         Some(ReadHandle {
             _parent: self,
@@ -93,7 +179,7 @@ impl<T> DblBuf<T> {
 
     pub fn read(&self) -> ReadHandle<T> {
         let guard = self.lock.read().unwrap();
-        let buf = unsafe { self.get_buf(!*guard) };
+        let buf = unsafe { self.get_buf(!guard.write_buf) };
 
         ReadHandle {
             _parent: self,
@@ -102,10 +188,11 @@ impl<T> DblBuf<T> {
         }
     }
 
-    unsafe fn write(&self, range: Range<usize>) -> WriteHandle<T> {
+    unsafe fn write(&self, thread: usize) -> WriteHandle<T> {
         let guard = self.lock.read().unwrap();
+        let range = guard.range(thread);
 
-        let buf = self.get_buf(*guard);
+        let buf = self.get_buf(guard.write_buf);
 
         WriteHandle {
             parent: self,
@@ -141,7 +228,7 @@ impl<T> DblBuf<T> {
 
     pub fn swap(&self) {
         let curr = match self.lock.try_read() {
-            Ok(guard) => *guard,
+            Ok(guard) => guard.write_buf,
             // Already trying to swap, just wait for release
             Err(TryLockError::WouldBlock) => {
                 let _ = self.lock.read().unwrap();
@@ -151,7 +238,7 @@ impl<T> DblBuf<T> {
             e => { let _ = e.unwrap(); unreachable!() },
         };
 
-        *self.lock.write().unwrap() = !curr;
+        self.lock.write().unwrap().write_buf = !curr;
 
         println!("Swap! {:?} -> {:?}", curr, !curr);
     }
@@ -171,31 +258,20 @@ impl<T: Clone> DblBuf<T> {
     pub fn new_with_elem(threads: usize, buf_size: usize, elem: T) -> (Arc<Self>, Handles<T>) {
         let bufa = vec![elem.clone(); buf_size];
         let bufb = vec![elem; buf_size];
-        Self::new(threads, bufa, bufb)
-    }
-}
-
-impl<T> Drop for DblBuf<T> {
-    fn drop(&mut self) {
-        // Safe because there should be no references to this struct anymore.
-        unsafe {
-            let mut bufs = self.bufs_mut();
-            bufs.drop_all();
-            bufs.free();
-        }
+        Self::with_bufs(threads, bufa, bufb)
     }
 }
 
 pub struct BufHandle<T> { 
     buf: Arc<DblBuf<T>>,
-    mut_range: Range<usize>,
+    thread: usize,
 }
 
 impl<T> BufHandle<T> {
     pub fn read_write(&mut self) -> (ReadHandle<T>, WriteHandle<T>) {
         (
             self.buf.read(),
-            unsafe { self.buf.write(self.mut_range.clone()) },
+            unsafe { self.buf.write(self.thread) },
         )
     }
 
@@ -204,51 +280,21 @@ impl<T> BufHandle<T> {
     }
 }
 
-struct ChunkRanges {
-    aligned_len: usize,
-    rem_count: usize,
-    curr: usize,
-    end: usize,
-}
-
-impl Iterator for ChunkRanges {
-    type Item = Range<usize>;
-
-    fn next(&mut self) -> Option<Self::Item> {
-        if self.rem_count > 0 {
-            let start = self.curr;
-            let rem_len = self.end - self.curr;
-        
-            let raw_chunk_size = rem_len / self.rem_count;
-
-            // Get the next multiple of `self.aligned_len` up from `raw_chunk_size`
-            let chunk_size = math::next_multiple(raw_chunk_size, self.aligned_len);
-
-            let end = cmp::min(start + chunk_size, self.end);
-            self.curr = end;
-            self.rem_count -= 1;
-
-            Some(start .. end)
-        } else {
-            None
-        } 
-    }
-}
 
 /// An iterator which yields `BufHandle`.
 pub struct Handles<T> {
     buf: Arc<DblBuf<T>>,
-    ranges: ChunkRanges,    
+    threads: Range<usize>,    
 }    
 
 impl<T> Iterator for Handles<T> {
     type Item = BufHandle<T>;
 
     fn next(&mut self) -> Option<Self::Item> {
-        self.ranges.next().map(|range| 
+        self.threads.next().map(|thread| 
             BufHandle {
                 buf: self.buf.clone(),
-                mut_range: range,
+                thread: thread,
             }
         )
     }
@@ -256,7 +302,7 @@ impl<T> Iterator for Handles<T> {
 
 pub struct WriteHandle<'a, T: 'a> {
     parent: &'a DblBuf<T>,
-    guard: ReadGuard<'a, WriteBuf>,
+    guard: ReadGuard<'a, BufState<T>>,
     buf: &'a mut [T],
 }
 
@@ -277,7 +323,7 @@ impl<'a, T: 'a> Deref for WriteHandle<'a, T> {
 /// Get the indices in the original buffer for the given `WriteHandle`.
 pub fn write_range<T>(hndl: &WriteHandle<T>) -> (usize, usize) {
     let ptr = hndl.buf.as_ptr();
-    let orig_ptr = unsafe { hndl.parent.get_buf(*hndl.guard).as_ptr() };
+    let orig_ptr = unsafe { hndl.parent.get_buf(hndl.guard.write_buf).as_ptr() };
     let offset = orig_ptr as usize - ptr as usize;
 
     (offset, offset + hndl.buf.len())
@@ -285,7 +331,7 @@ pub fn write_range<T>(hndl: &WriteHandle<T>) -> (usize, usize) {
 
 pub struct ReadHandle<'a, T: 'a> {
     _parent: &'a DblBuf<T>,
-    _guard: ReadGuard<'a, WriteBuf>,
+    _guard: ReadGuard<'a, BufState<T>>,
     buf: &'a [T],
 }
 
@@ -298,58 +344,23 @@ impl<'a, T: 'a> Deref for ReadHandle<'a, T> {
 
 pub struct Exclusive<'a, T: 'a> {
     parent: &'a DblBuf<T>,
-    guard: WriteGuard<'a, WriteBuf>,
+    guard: WriteGuard<'a, BufState<T>>,
 }
 
 impl<'a, T: 'a> Exclusive<'a, T> {
     pub fn bufs(&mut self) -> (&mut [T], &mut [T]) {
         // Safe because we have exclusive access to the buffers
-        unsafe { self.parent.get_bufs(*self.guard) }
+        unsafe { self.parent.get_bufs(self.guard.write_buf) }
     }
 
-    pub fn resize_with_fn<F: FnMut(usize) -> T>(&mut self, new_len: usize, mut resize_fn: F) {
-        let bufs = unsafe { self.parent.bufs_mut() };
-
-        let old_len = bufs.len();
-
+    pub fn resize_with_fn<F: FnMut(usize, bool) -> T>(&mut self, new_len: usize, resize_fn: F) {
         unsafe {
-            if new_len < bufs.len() {
-                bufs.drop_range(old_len, new_len);
-            }
-            bufs.realloc(new_len);
-        }
-        
-        if new_len > old_len {
-            let mut make_buf = || (old_len .. new_len).map(&mut resize_fn).collect::<Vec<T>>();
-            let mut bufa_extend = make_buf();
-            let mut bufb_extend = make_buf();
-
-            unsafe {
-                let mut bufa = &mut bufs.bufa()[new_len ..];
-
-                ptr::copy_nonoverlapping(
-                    bufa_extend.as_ptr(),
-                    bufa.as_mut_ptr(),
-                    bufa.len(),
-                );
-
-                bufa_extend.set_len(0);
-
-                let mut bufb = &mut bufs.bufb()[new_len ..];
-
-                ptr::copy_nonoverlapping(
-                    bufb_extend.as_ptr(),
-                    bufb.as_mut_ptr(),
-                    bufb.len(),
-                );
-
-                bufb_extend.set_len(0);
-            }
+            self.parent.bufs_mut().resize_with_fn(new_len, resize_fn);
         }
     }
 
     pub fn swap(&mut self) {
-        let curr = *self.guard;
-        *self.guard = !curr;
+        let curr = self.guard.write_buf;
+        self.guard.write_buf = !curr;
     }
 }
